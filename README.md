@@ -1,12 +1,22 @@
 # dd-laptop-setup-check
 
-An idempotent audit-and-install script for a Datadog macOS work laptop. It walks the
-steps in the internal **Datadog Laptop Setup Guide**, reports what is already in place,
-and installs what is missing.
+An idempotent audit-and-install script for the Datadog macOS work laptop baseline. It
+walks the internal setup guide, reports what is already in place, and installs what is
+missing.
 
 Written because "did the setup actually finish?" is otherwise a half-day of manual
 `command -v` checks, and because a few of the steps fail in ways that look like
 something else entirely.
+
+Companion repos cover the per-track setup:
+
+| Repo | Covers |
+| --- | --- |
+| [datadog-frontend-setup](https://github.com/alaodd/datadog-frontend-setup) | the frontend (`web-ui`) track |
+| [datadog-backend-setup](https://github.com/alaodd/datadog-backend-setup) | the backend (`dd-source`) track |
+
+Run this one first, then whichever track applies. The two track repos are mutually
+exclusive by design: frontend-only contributors do not need `laptop-setup.sh` at all.
 
 ## What it reports
 

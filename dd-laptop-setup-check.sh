@@ -135,6 +135,141 @@ checking()  { emit "  ${C_DIM}checking:${C_RESET} $1"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# A download that "succeeded" is not the same as a usable script. DataDog/devtools
+# is private, so the documented `curl -Lo ... github.com/.../raw/...` quietly saves
+# a login/SSO HTML page when unauthenticated — a large, non-empty file that is not
+# a shell script at all. Check the shebang and reject HTML explicitly.
+valid_shell_script() { # valid_shell_script <path>
+  [ -s "$1" ] || return 1
+  local first
+  IFS= read -r first < "$1" 2>/dev/null || return 1
+  case "$first" in \#!*) ;; *) return 1 ;; esac
+  if head -c 4096 "$1" 2>/dev/null | grep -qiE '<!doctype html|<html[ >]'; then
+    return 1
+  fi
+  return 0
+}
+
+# `stat` is not portable here. macOS ships BSD stat, where -f is a format
+# string, but Homebrew coreutils puts a GNU stat on PATH where -f means
+# "file system status" and the same call prints filesystem info instead of a
+# mode. Prefer the absolute BSD path, then fall back to the GNU spelling.
+file_mode() { # file_mode <path> -> octal mode, empty when it cannot be read
+  local m
+  m="$(/usr/bin/stat -f '%OLp' "$1" 2>/dev/null)"
+  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
+  m="$(stat -c '%a' "$1" 2>/dev/null)"
+  if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
+  return 1
+}
+
+
+# Interactive commands must own the terminal. install_step pipes through tee so
+# it can log output, but that makes stdout a pipe and breaks prompts and
+# browser-handoff flows. Run these attached instead, and record only the
+# invocation and exit status in the log.
+# `git config-tool setup` manages commit-signing keys through whichever account
+# gh has ACTIVE, and that needs the admin:ssh_signing_key scope. With a personal
+# and a work account both logged in, the active one is easily the wrong one —
+# and the tool's own advice ("gh auth refresh --scopes admin:ssh_signing_key")
+# would grant that scope to the personal account and sign under it. Prefer
+# switching accounts over widening scopes.
+gh_accounts_table() { # -> "<login>|<active 0|1>|<scopes>" per account
+  run_timeout 40 gh auth status 2>&1 | awk '
+    /Logged in to .* account / {
+      if (acct != "") print acct "|" active "|" scopes
+      acct=$0; sub(/.*account /,"",acct); sub(/ .*/,"",acct); active=0; scopes=""
+    }
+    /Active account: true/ { active=1 }
+    /Token scopes:/        { s=$0; sub(/.*Token scopes: /,"",s); scopes=s }
+    END { if (acct != "") print acct "|" active "|" scopes }
+  '
+}
+
+# 0 when the active gh account can manage signing keys (after an offered switch
+# if needed); 1 when it cannot and setup would fail the same way again.
+ensure_gh_signing_account() {
+  have gh || { info "gh is not installed; cannot verify which accounts setup will use."; return 0; }
+  local table n internal public missing_scope
+  table="$(gh_accounts_table)"
+  [ -z "$table" ] && { warn "gh signing accounts" "no gh accounts logged in"; return 1; }
+
+  n="$(printf '%s\n' "$table" | grep -c .)"
+  internal="$(printf '%s\n' "$table" | awk -F'|' '$1 ~ /_ddog$/ {print $1}' | head -1)"
+  public="$(printf '%s\n' "$table" | awk -F'|' '$1 !~ /_ddog$/ {print $1}' | head -1)"
+  printf '%s\n' "$table" | while IFS='|' read -r acct act sc; do
+    case "$sc" in *admin:ssh_signing_key*) info "$acct: has admin:ssh_signing_key" ;;
+                  *) info "$acct: MISSING admin:ssh_signing_key" ;; esac
+  done
+
+  # The tool manages two identities on purpose: DataDog-org repos through your
+  # public account, ddoghq internal repos through the *_ddog one. It refuses to
+  # run with anything other than exactly those two.
+  if [ "$n" -ne 2 ] || [ -z "$internal" ] || [ -z "$public" ]; then
+    warn "gh signing accounts" "setup needs exactly two accounts — one public and one ending in _ddog; found $n (${internal:-no _ddog account}${public:+, public: $public})"
+    if [ -z "$internal" ]; then
+      info "Sign in to your internal account: gh auth login --skip-ssh-key --web -p ssh --scopes=admin:ssh_signing_key"
+    fi
+    if [ -z "$public" ]; then
+      info "Sign in to your PUBLIC Datadog account (the one 'ssh -T git@github.com' reports), not an unrelated personal one:"
+      info "  gh auth login --skip-ssh-key --web -p ssh --scopes=admin:ssh_signing_key"
+      local ssh_who
+      ssh_who="$(run_timeout 20 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | sed -n 's/^Hi \([^!]*\)!.*/\1/p' | head -1)"
+      [ -n "$ssh_who" ] && info "  github.com SSH authenticates as '$ssh_who' — that is the public account to use."
+    fi
+    if [ "$n" -gt 2 ]; then
+      info "Remove any unrelated account: gh auth logout --hostname github.com --user <login>"
+    fi
+    return 1
+  fi
+
+  # Both accounts need the scope; gh auth refresh only applies to the active one.
+  missing_scope="$(printf '%s\n' "$table" | awk -F'|' '$3 !~ /admin:ssh_signing_key/ {print $1}')"
+  if [ -n "$missing_scope" ]; then
+    warn "gh signing accounts" "missing admin:ssh_signing_key on: $(printf '%s' "$missing_scope" | tr '\n' ' ')"
+    info "gh auth refresh only applies to the active account, so switch to each one first:"
+    printf '%s\n' "$missing_scope" | while IFS= read -r acct; do
+      [ -n "$acct" ] && info "  gh auth switch --hostname github.com --user $acct && gh auth refresh --hostname github.com --scopes admin:ssh_signing_key"
+    done
+    return 1
+  fi
+
+  ok_cfg "gh signing accounts" "public '$public' and internal '$internal', both with admin:ssh_signing_key"
+  return 0
+}
+
+install_step_interactive() {
+  local item="$1" cmd="$2"
+  info "command: $cmd"
+  info "(interactive — it takes over this terminal and prompts you directly)"
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    skipped "$item" "not applied (--check-only)"; return 1
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    skipped "$item" "would run: $cmd (--dry-run)"; return 1
+  fi
+  if [ ! -t 0 ]; then
+    skipped "$item" "needs an interactive terminal — run it yourself: $cmd"; return 1
+  fi
+  if ! confirm "Run $item now? It will prompt you directly."; then
+    skipped "$item" "declined at prompt"; return 1
+  fi
+  emit "  ${C_DIM}running (interactive):${C_RESET} $cmd"
+  printf '  [interactive] %s\n' "$cmd" >> "$LOG_FILE"
+  # Run attached so prompts and browser handoff work. The cost is that output
+  # goes to the terminal rather than the log, so the exit status is all we can
+  # record here — which makes reporting it non-negotiable.
+  bash -c "$cmd"
+  local rc=$?
+  printf '  [interactive] exit %d\n' "$rc" >> "$LOG_FILE"
+  if [ "$rc" -ne 0 ]; then
+    failed "$item" "command exited $rc — its output went to your terminal, not the log"
+    info "To capture the output for diagnosis, re-run it under script:"
+    info "  script -q /tmp/${item// /-}.log $cmd"
+  fi
+  return $rc
+}
+
 # Poor-man's timeout: macOS has no coreutils `timeout` by default.
 run_timeout() { # run_timeout <seconds> <cmd...>
   local secs="$1"; shift
@@ -191,7 +326,9 @@ mode_desc="install missing items (prompting)"
 emit "${C_DIM}Mode:  ${mode_desc}${C_RESET}"
 
 if [ -z "$DD_EMAIL" ]; then
-  DD_EMAIL="$(git config --global user.email 2>/dev/null || true)"
+  # Effective value, not the raw ~/.gitconfig one: git-config-tool installs an
+  # include whose value wins, so --global alone reports a stale address.
+  DD_EMAIL="$(git config --get user.email 2>/dev/null || true)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -242,8 +379,13 @@ else
 fi
 
 # 1.3 git identity
-checking "git global user.email"
-gh_email="$(git config --global user.email 2>/dev/null || true)"
+checking "git user.email (effective, including managed includes)"
+gh_email="$(git config --get user.email 2>/dev/null || true)"
+gh_email_raw="$(git config --global --get user.email 2>/dev/null || true)"
+if [ -n "$gh_email" ] && [ -n "$gh_email_raw" ] && [ "$gh_email" != "$gh_email_raw" ]; then
+  info "~/.gitconfig says '$gh_email_raw', but an include overrides it to '$gh_email' — commits use the latter."
+  info "Source: $(git config --show-origin --get user.email 2>/dev/null | awk '{print $1}')"
+fi
 if [ -z "$gh_email" ]; then
   if [ -n "$DD_EMAIL" ] && [ "$DD_EMAIL" != "$gh_email" ]; then
     if install_step "git user.email" "git config --global user.email \"$DD_EMAIL\""; then
@@ -253,7 +395,7 @@ if [ -z "$gh_email" ]; then
     manual "git user.email" "unset — run: git config --global user.email \"your.name@datadoghq.com\" (or re-run with --email)"
   fi
 elif [[ "$gh_email" == *"@datadoghq.com" ]]; then
-  ok_cfg "git user.email" "$gh_email"
+  ok_cfg "git user.email" "$gh_email (effective)"
 else
   warn "git user.email" "$gh_email is not an @datadoghq.com address"
 fi
@@ -579,11 +721,20 @@ fi
 # 2.3 Datadog engineering setup script
 checking "Datadog engineering setup script (laptop-setup.sh)"
 setup_script=""
-for candidate in "$HOME/Downloads/laptop-setup.sh" "$HOME/laptop-setup.sh"; do
-  [ -f "$candidate" ] && setup_script="$candidate" && break
+empty_script=""
+# Test -s, not -f: a 0-byte file from a failed download is the common state and
+# would otherwise be reported as present.
+for candidate in "${DATADOG_ROOT:-$HOME/dd}/devtools/laptop-ansible/laptop-setup.sh" \
+                 "$HOME/Downloads/laptop-setup.sh" "$HOME/laptop-setup.sh"; do
+  if valid_shell_script "$candidate"; then setup_script="$candidate"; break; fi
+  [ -e "$candidate" ] && [ -z "$empty_script" ] && empty_script="$candidate"
 done
+if [ -z "$setup_script" ] && [ -n "$empty_script" ]; then
+  warn "laptop-setup.sh" "$empty_script exists but is not a usable script — $(file -b "$empty_script" 2>/dev/null | cut -c1-40)"
+  info "Re-download: curl -Lo \"$empty_script\" https://github.com/DataDog/devtools/raw/master/laptop-ansible/laptop-setup.sh"
+fi
 if [ -n "$setup_script" ]; then
-  ok "laptop-setup.sh" "present at $setup_script"
+  ok "laptop-setup.sh" "present at $setup_script ($(wc -c < "$setup_script" | tr -d ' ') bytes)"
   manual "laptop-setup.sh run" "cannot verify it completed — re-run manually if unsure: /bin/bash $setup_script (safe to re-run, can take hours)"
 else
   info "Source: https://github.com/DataDog/devtools/raw/master/laptop-ansible/laptop-setup.sh (requires GitHub access + AppGate)"
@@ -601,13 +752,13 @@ fi
 # 2.4 Shell config permissions
 checking "~/.zshrc permissions"
 if [ -f "$HOME/.zshrc" ]; then
-  zshrc_mode="$(stat -f '%OLp' "$HOME/.zshrc" 2>/dev/null)"
+  zshrc_mode="$(file_mode "$HOME/.zshrc")"
   if [ "$zshrc_mode" = "600" ]; then
     ok_cfg "~/.zshrc permissions" "mode $zshrc_mode"
   elif printf '%s' "$zshrc_mode" | grep -qE '^[0-7][2367][0-7]$|^[0-7][0-7][2367]$'; then
     warn "~/.zshrc permissions" "mode $zshrc_mode is group- or world-writable"
     if install_step "~/.zshrc permission fix" "chmod 600 \"$HOME/.zshrc\""; then
-      installed "~/.zshrc permission fix" "now mode $(stat -f '%OLp' "$HOME/.zshrc" 2>/dev/null) — restart Terminal"
+      installed "~/.zshrc permission fix" "now mode $(file_mode "$HOME/.zshrc") — restart Terminal"
     fi
   else
     ok_cfg "~/.zshrc permissions" "mode $zshrc_mode (not 600, but not writable by others — the guide's chmod 600 is only needed if your shell complains)"
@@ -660,8 +811,10 @@ if [ -n "$gct" ]; then
       ok_cfg "git-config-tool doctor" "all checks passing"
     else
       warn "git-config-tool doctor" "exit $gct_rc — SSH keys / signing not fully configured"
-      info "Fix interactively (this script will not run it for you): $gct setup"
       printf '%s\n' "$gct_out" | tail -20 | while IFS= read -r line; do info "$line"; done
+      if ensure_gh_signing_account && install_step_interactive "git-config-tool setup" "$gct setup"; then
+        installed "git-config-tool setup" "completed — re-run this script to re-check doctor"
+      fi
     fi
   fi
 else
@@ -748,7 +901,10 @@ else
   fi
 
   if [ -z "$gl_token" ]; then
-    warn "GitLab authentication" "no token available — run: ddtool auth gitlab login && ddtool auth gitlab token"
+    warn "GitLab authentication" "no token available"
+    if install_step_interactive "GitLab login" "ddtool auth gitlab login"; then
+      installed "GitLab login" "completed — re-run this script to verify group access"
+    fi
     skipped "GitLab $GITLAB_GROUP group access" "no GitLab token to test with"
   else
     gl_user="$(run_timeout 25 curl -s --max-time 20 --header "$gl_auth_header" "https://${GITLAB_HOST}/api/v4/user" 2>/dev/null)"
